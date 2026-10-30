@@ -1,0 +1,6 @@
+# build artifacts
+*.exe
+*.res
+*.o
+# editor/agent scratch
+.workbuddy/
