@@ -14,6 +14,8 @@
 #include <wchar.h>
 #include <string.h>
 #include <math.h>
+
+#include "version.h"   // 版本号唯一来源
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -38,30 +40,31 @@
 #define TRAY_ICON_SIZE 32
 
 /* 视觉规格：96 DPI 下的逻辑值，运行时按 DPI 缩放 */
-#define L_PILL_H      40  // 胶囊高度
-#define L_RADIUS      13  // 圆角半径
-#define L_PAD_L       16  // 左内边距
-#define L_PAD_R       18  // 右内边距
-#define L_ICON_W      15  // 图标宽度
-#define L_GAP         9   // 图文间距
-#define L_FONT_PX     16  // 正文字号
-#define L_SHADOW_M    9   // 投影留白
+#define L_PILL_H      32  // 胶囊高度
+#define L_RADIUS      10  // 圆角半径
+#define L_PAD_L       12  // 左内边距
+#define L_PAD_R       14  // 右内边距
+#define L_ICON_W      12  // 图标宽度
+#define L_GAP         7   // 图文间距
+#define L_FONT_PX     13  // 正文字号
+#define L_SHADOW_M    7   // 投影留白
 #define L_SHADOW_DY   2   // 投影垂直偏移
-#define L_SHADOW_BLUR 7   // 投影模糊半径
-#define L_BOTTOM_GAP  10  // 距任务栏
-#define L_MIN_PILL_W  104 // 胶囊最小宽度
+#define L_SHADOW_BLUR 5   // 投影模糊半径
+#define L_BOTTOM_GAP  8   // 距任务栏
+#define L_MIN_PILL_W  84  // 胶囊最小宽度
+#define L_TRAY_RADIUS 26  // 托盘图标圆角（独立于胶囊，避免缩小胶囊时图标变方）
 
 /* 颜色与不透明度 */
 #define C_BG     RGB(32, 33, 40)    // 胶囊主体
 #define C_TEXT   RGB(245, 245, 247) // 正文
 #define C_ICON   RGB(74, 222, 128)  // 图标
-#define A_BG     (230.0f / 255.0f)  // 主体 ~90%
-#define A_BORDER (26.0f / 255.0f)   // 描边 ~10%
-#define A_SHADOW (70.0f / 255.0f)   // 投影
+#define A_BG     (168.0f / 255.0f)  // 主体 ~66%（半透明）
+#define A_BORDER (34.0f / 255.0f)   // 描边 ~13%
+#define A_SHADOW (58.0f / 255.0f)   // 投影（随主体变淡而减淡）
 
 static const wchar_t kWndMain[]    = L"CopytipsMain";
 static const wchar_t kWndToast[]   = L"CopytipsToast";
-static const wchar_t kAppName[]    = L"Copytips";
+#define kAppName L"Copytips"  // 字面量而非数组：便于与版本号拼成相邻宽字符串常量
 static const wchar_t kRegPath[]    = L"Software\\Copytips";
 static const wchar_t kRegRun[]     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t kRegVal[]     = L"AutoRun";
@@ -414,6 +417,7 @@ static INT_PTR CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM)
 {
     if (m == WM_INITDIALOG) // 勾选态同步 + Win11 圆角
     {
+        SetWindowTextW(h, L"Copytips " APP_VERSION_WSTR); // 标题带版本，方便确认跑的是哪一版
         CheckDlgButton(h, IDC_CHK_RUN, GetAutoRun() ? BST_CHECKED : BST_UNCHECKED);
         ApplyRoundedCorners(h);
         return TRUE;
@@ -459,7 +463,7 @@ static HICON CreateTrayIcon(int size)
     HGDIOBJ oldBmp = SelectObject(mem, bmp);
     // 深色圆角方块（笔与刷同色，避免边缘出现一圈透明细线）
     const COLORREF bg = C_BG;
-    const int rad = MulDiv(size, L_RADIUS, 96);
+    const int rad = MulDiv(size, L_TRAY_RADIUS, 96);
     HBRUSH br = CreateSolidBrush(bg);
     HPEN pen = CreatePen(PS_SOLID, 1, bg);
     HGDIOBJ oldBr = SelectObject(mem, br), oldPen = SelectObject(mem, pen);
@@ -541,7 +545,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     g_nid.hWnd = g_hwndMain; g_nid.uID = TRAY_ICON_ID;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY; g_nid.hIcon = g_hIconTray;
-    lstrcpynW(g_nid.szTip, kAppName, (int)(sizeof(g_nid.szTip) / sizeof(g_nid.szTip[0])));
+    lstrcpynW(g_nid.szTip, kAppName L" " APP_VERSION_WSTR, (int)(sizeof(g_nid.szTip) / sizeof(g_nid.szTip[0])));
     Shell_NotifyIconW(NIM_ADD, &g_nid);
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
