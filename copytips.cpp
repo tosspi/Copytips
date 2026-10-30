@@ -50,7 +50,7 @@
 #define L_SHADOW_M    7   // 投影留白
 #define L_SHADOW_DY   2   // 投影垂直偏移
 #define L_SHADOW_BLUR 5   // 投影模糊半径
-#define L_BOTTOM_GAP  8   // 距任务栏
+#define L_BOTTOM_GAP  16  // 距任务栏的最小间距
 #define L_MIN_PILL_W  84  // 胶囊最小宽度
 #define L_TRAY_RADIUS 26  // 托盘图标圆角（独立于胶囊，避免缩小胶囊时图标变方）
 
@@ -346,6 +346,33 @@ static void EnsureToastWindow()
         nullptr, nullptr, g_hInst, nullptr);
 }
 
+// 取「可用区域底边」。任务栏自动隐藏（ABS_AUTOHIDE）时 SPI_GETWORKAREA 不预留空间、
+// 直接返回整屏，会让胶囊压到任务栏上；此时改用 Shell_TrayWnd 的真实矩形。
+// 注意：自动隐藏的任务栏会整体滑出屏幕（本机隐藏时 rect 为 0,1078-1920,1126），
+// 其 top 不能直接用，要用「屏幕底 - 任务栏厚度」还原它弹出后占据的顶边。
+// 另：SHAppBarMessage(ABM_GETTASKBARPOS) 在本机返回无效数据，故不采用。
+static int BottomSafeLine()
+{
+    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int safe = screenH;
+    RECT wa = {};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > 0 && wa.bottom < safe)
+        safe = wa.bottom; // 任务栏未自动隐藏：工作区底边本身就是安全线
+    RECT tr = {};
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tray || !GetWindowRect(tray, &tr)) return safe;
+    const int thick = (int)(tr.bottom - tr.top); // 任务栏厚度：隐藏/弹出两种状态下不变
+    // 必须同时满足：左右贴满、厚度合理、且纵向位于屏幕下半区
+    // —— 顶部停靠的任务栏横向也贴满（0,0-1920,48），只能用纵向位置排除
+    const bool bottomDocked = tr.left <= 0 && tr.right >= screenW
+                              && thick > 0 && thick < screenH / 2
+                              && tr.top > screenH / 2;
+    const int revealedTop = screenH - thick;     // 它弹出后占据的顶边
+    if (bottomDocked && revealedTop > 0 && revealedTop < safe) safe = revealedTop;
+    return safe;
+}
+
 // 渲染 + 定位 + 投放；尺寸与 DPI 不变时完全复用已有 DIB 与字体
 static bool RenderToast()
 {
@@ -361,14 +388,15 @@ static bool RenderToast()
     memset(g_toast.bits, 0, (size_t)winW * (size_t)winH * 4); // 全黑，alpha = 0
     DrawContentToDib(M, pillW, pillH);
     CompositeToPremultipliedBgra(winW, winH, M, pillW, pillH);
-    // 位置：任务栏（工作区）上方 L_BOTTOM_GAP，水平居中
+    // 位置：可用区域底边上方 L_BOTTOM_GAP，水平居中（水平方向仍用工作区，竖屏/侧边栏任务栏下也正确）
     RECT wa = {};
     if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) // 任务栏（工作区）
     {
         wa.right = GetSystemMetrics(SM_CXSCREEN); wa.bottom = GetSystemMetrics(SM_CYSCREEN);
     }
+    const int safeBottom = BottomSafeLine();
     POINT dst = { wa.left + (wa.right - wa.left - pillW) / 2 - M,
-                  wa.bottom - Dpi(L_BOTTOM_GAP) - pillH - M };
+                  safeBottom - Dpi(L_BOTTOM_GAP) - pillH - M };
     SIZE size = { winW, winH };
     POINT src = { 0, 0 };
     BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
