@@ -1,4 +1,4 @@
-// copytips.cpp
+﻿// copytips.cpp
 // 极简剪贴板提示器：复制文本 -> 屏幕底部居中弹出圆角胶囊 "✓ Copied"，2 秒后消失。
 // 构建（与 README 一致，必须保持可用）：
 //   rc copytips.rc
@@ -7,6 +7,11 @@
 // 设计要点：单文件零依赖（仅 user32/gdi32/shell32/advapi32）；DWM 圆角用 LoadLibraryW 动态加载，
 // 不新增导入库；弹窗懒创建且全局唯一，重复复制只重置定时器 + 重绘；DIB/DC/字体/托盘图标全部缓存
 // 复用；逐像素 alpha（32bpp 顶向下 DIB + UpdateLayeredWindow）实现平滑圆角与柔和投影。
+// 触发判定：剪贴板「被写入」不等于「用户复制了」（选中即复制的终端、剪贴板管理器、脚本写入都算）。
+// 三个旁证信号任一成立即视为复制意图：① 键盘钩子捕获 Ctrl+C/X/Insert、Shift+Delete；
+// ② 鼠标钩子捕获右键抬起（覆盖右键菜单里的「复制」）；③ 40ms 轮询 GetAsyncKeyState
+// （它读的是整个桌面的物理键状态，不受 UIPI 限制，可兜住管理员窗口里的按键）。
+// 再叠加「写入者是前台进程」与「内容非空」两道校验，才弹提示。
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601 // AddClipboardFormatListener 等需要 Vista+
 #include <windows.h>
@@ -38,6 +43,15 @@
 #define TOAST_MS       2000
 #define TRAY_ICON_ID   1
 #define TRAY_ICON_SIZE 32
+
+/* 触发判定参数 */
+#define INTENT_WINDOW_MS      400   // 复制快捷键按下后，多久内的剪贴板更新算作它的结果（真实复制通常 <50ms）
+#define INTENT_WINDOW_RDP_MS  1500  // 远程桌面剪贴板重定向明显更慢，此时放宽窗口
+#define MENU_INTENT_WINDOW_MS 2500  // 右键抬起后，多久内的剪贴板更新算作菜单里的「复制」
+#define INTENT_POLL_MS        40    // GetAsyncKeyState 轮询间隔（UIPI 兜底，见 PollCopyCombo）
+#define CLIP_OPEN_TRIES       5     // 打开剪贴板的重试次数（它常被别的进程短暂占用）
+#define CLIP_OPEN_WAIT_MS     10    // 每次重试之间的等待（最多 ~50ms，不能再长：会拖住 UI 线程）
+#define TIMER_INTENT_POLL     2     // 主窗口上的意图轮询定时器 id（TIMER_TOAST=1 属于弹窗窗口）
 
 /* 视觉规格：96 DPI 下的逻辑值，运行时按 DPI 缩放 */
 #define L_PILL_H      32  // 胶囊高度
@@ -77,6 +91,15 @@ static HICON     g_hIconTray = nullptr; // 托盘图标
 static bool      g_iconOwned = false;   // 仅自绘图标才可 DestroyIcon（系统共享图标不可销毁）
 static int       g_dpi       = 96;      // 系统 DPI，声明 DPI 感知后即固定
 static NOTIFYICONDATAW g_nid;           // 托盘图标数据
+
+// 复制意图状态：键盘钩子 + 鼠标钩子 + 轮询兜底 + 剪贴板序列号去重
+static HHOOK     g_hKeyHook         = nullptr; // nullptr = 键盘钩子未装上
+static HHOOK     g_hMouseHook       = nullptr; // nullptr = 鼠标钩子未装上
+static DWORD     g_lastIntentMs     = 0;       // 最近一次复制快捷键的 GetTickCount()；0 = 从未
+static DWORD     g_lastMenuIntentMs = 0;       // 最近一次右键抬起的 GetTickCount()；0 = 从未
+static DWORD     g_lastClipSeq      = 0;       // 已处理过的剪贴板序列号
+static bool      g_pollWasCopyCombo = false;   // 轮询用：上一次采样是否处于复制组合键（边沿检测）
+static DWORD     g_intentWindowMs   = 0;       // 懒计算：本地 400ms / 远程桌面 1500ms
 
 // 弹窗状态：窗口 + DIB 缓存 + 字体缓存，全部懒创建并复用
 struct ToastState
@@ -429,6 +452,135 @@ static void ShowToast()
     ShowWindow(g_toast.hwnd, SW_SHOWNOACTIVATE);
 }
 
+/* ---------------- 复制意图判定 ---------------- */
+// 为什么需要这一层：WM_CLIPBOARDUPDATE 只能说明「剪贴板被某个进程写入」，并不能说明「用户复制了」。
+// 开启「选中即复制」的终端/词典/浏览器扩展、剪贴板管理器与云同步、输入法、脚本 Set-Clipboard
+// 都会写入剪贴板；只探测格式是否可用就弹窗（旧实现）必然在这些场景下误弹。
+// 现在改为「意图驱动」：钩子只记录复制动作发生的时刻（快捷键 / 右键菜单 / 轮询兜底），
+// 剪贴板更新落在时间窗内、写入者又是前台进程、内容确实非空，才认为一次复制动作完成。
+static bool IsCopyCombo(const KBDLLHOOKSTRUCT& kb)
+{
+    // 只比较 DWORD，避免 /W4 下的有符号/无符号比较警告
+    static const DWORD kKeyC      = (DWORD)'C';       // Ctrl+C
+    static const DWORD kKeyX      = (DWORD)'X';       // Ctrl+X（剪切同样写入剪贴板）
+    static const DWORD kKeyInsert = (DWORD)VK_INSERT; // Ctrl+Insert（Unix 习惯，等价于复制）
+    static const DWORD kKeyDel    = (DWORD)VK_DELETE; // Shift+Delete（资源管理器剪切）
+    const DWORD vk = kb.vkCode;
+    // 用 GetAsyncKeyState 现取修饰键状态：不需要自己维护按键状态机，
+    // 也不会因为「钩子安装前 Ctrl 就已按下」而漏判。只要 Ctrl 在按，Shift 组合（终端 Ctrl+Shift+C）也算复制。
+    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0)
+        return vk == kKeyC || vk == kKeyX || vk == kKeyInsert;
+    if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0)
+        return vk == kKeyDel;
+    return false;
+}
+
+// 低层键盘钩子回调必须极轻：只做位判断与整数比较，绝不 I/O、不加锁、不创建窗口。
+// 任何阻塞都会拖慢全系统的键盘输入（系统对超时的钩子会直接摘掉）。
+static LRESULT CALLBACK KeyHookProc(int code, WPARAM w, LPARAM l)
+{
+    if (code == HC_ACTION && (w == WM_KEYDOWN || w == WM_SYSKEYDOWN))
+    {
+        const KBDLLHOOKSTRUCT* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(l);
+        if (kb && IsCopyCombo(*kb)) g_lastIntentMs = GetTickCount();
+    }
+    return CallNextHookEx(g_hKeyHook, code, w, l);
+}
+
+// 鼠标钩子：右键抬起只记一个时间戳，不去猜菜单窗口类名
+//（Win11/Office/Chrome 的自绘菜单都不是传统 #32768，按类名判断会漏；按动作时间判断则全都覆盖）
+static LRESULT CALLBACK MouseHookProc(int code, WPARAM w, LPARAM l)
+{
+    if (code == HC_ACTION && w == WM_RBUTTONUP) g_lastMenuIntentMs = GetTickCount();
+    return CallNextHookEx(g_hMouseHook, code, w, l);
+}
+
+// UIPI 兜底：低层键盘钩子收不到发往更高完整性级别（管理员）窗口的按键，
+// 而 GetAsyncKeyState 读的是整个桌面的物理键状态，不受 UIPI 限制。
+// 只认「按下沿」：长按 Ctrl+C 不会把时间戳一直往后推。
+static void PollCopyCombo()
+{
+    const int vkC = 'C', vkX = 'X';
+    const bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool hit = (ctrl && ((GetAsyncKeyState(vkC) & 0x8000) != 0 ||
+                               (GetAsyncKeyState(vkX) & 0x8000) != 0 ||
+                               (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0))
+                     || (shift && (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0);
+    if (hit && !g_pollWasCopyCombo) g_lastIntentMs = GetTickCount();
+    g_pollWasCopyCombo = hit;
+}
+
+// 时间窗：远程桌面下剪贴板重定向慢，窗口放宽（只在首次调用时探测一次）
+static DWORD IntentWindowMs()
+{
+    if (g_intentWindowMs == 0)
+        g_intentWindowMs = GetSystemMetrics(SM_REMOTESESSION) ? INTENT_WINDOW_RDP_MS : INTENT_WINDOW_MS;
+    return g_intentWindowMs;
+}
+
+// 时间窗判定：GetTickCount 约 49.7 天回绕一次，无符号减法天然跨回绕正确
+static bool HasRecentCopyIntent()
+{
+    if (!g_hKeyHook && !g_hMouseHook) return true; // 两个钩子都没装上（极少见）：退化为宽松判定，保证工具仍可用
+    const DWORD now = GetTickCount();
+    if (g_lastIntentMs != 0 && (DWORD)(now - g_lastIntentMs) <= IntentWindowMs()) return true;
+    if (g_lastMenuIntentMs != 0 && (DWORD)(now - g_lastMenuIntentMs) <= (DWORD)MENU_INTENT_WINDOW_MS) return true;
+    return false;
+}
+
+// 剪贴板里是否真有非空文本：真正打开并读取，而不是只探测格式
+static bool ClipboardHasText()
+{
+    for (int i = 0; i < CLIP_OPEN_TRIES; ++i)
+    {
+        if (!OpenClipboard(nullptr)) { Sleep(CLIP_OPEN_WAIT_MS); continue; } // 被占用：小步退避
+        bool hasText = false;
+        if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+        {
+            HANDLE data = GetClipboardData(CF_UNICODETEXT);
+            const wchar_t* text = data ? static_cast<const wchar_t*>(GlobalLock(data)) : nullptr;
+            if (text)
+            {
+                hasText = (text[0] != L'\0'); // 只看首字符判空：再大的文本也是 O(1)，不复制内容
+                GlobalUnlock(data);           // 拿到就一定要解锁，否则句柄被永久锁住
+            }
+        }
+        CloseClipboard(); // 无论读取成功与否都必须关闭，否则整个系统的剪贴板会被锁死
+        return hasText;
+    }
+    return false; // 5×10ms 后仍被占用：本次不提示（宁可漏报，也绝不误报）
+}
+
+// 写入者必须是前台进程：云剪贴板同步、输入法、剪贴板管理器的程序化写入，owner 都不是前台进程。
+// 取不到 owner（NULL）或前台窗口时不做否决——宁可放行，也不误杀正常复制。
+static bool ClipboardOwnerIsForeground()
+{
+    const HWND owner = GetClipboardOwner();
+    if (!owner) return true;
+    const HWND fg = GetForegroundWindow();
+    if (!fg) return true;
+    DWORD pidOwner = 0, pidFg = 0;
+    GetWindowThreadProcessId(owner, &pidOwner);
+    GetWindowThreadProcessId(fg, &pidFg);
+    if (pidOwner == 0 || pidFg == 0) return true; // 查不到 PID：不做否决
+    return pidOwner == pidFg;
+}
+
+// WM_CLIPBOARDUPDATE 的统一入口：去重 -> 意图 -> 写入者 -> 内容 -> 提示
+static void OnClipboardUpdate()
+{
+    const DWORD seq = GetClipboardSequenceNumber(); // 每次写入 +1，用于丢弃重复通知（0 = 取不到，不参与比较）
+    if (seq != 0 && seq == g_lastClipSeq) return;
+    g_lastClipSeq = seq;
+    if (!HasRecentCopyIntent()) return;        // 没按复制键、也没刚用过右键菜单 -> 静默
+    if (!ClipboardOwnerIsForeground()) return; // 后台程序写入（云剪贴板 / 输入法 / 管理器）-> 静默
+    if (!ClipboardHasText()) return;           // 空写入 / 非文本 -> 静默
+    g_lastIntentMs = 0;                        // 消费掉这次意图：同一窗口内的后续写入不再二次弹窗
+    g_lastMenuIntentMs = 0;
+    ShowToast();
+}
+
 /* ---------------- DWM 圆角（动态加载，不新增导入库） ---------------- */
 static void ApplyRoundedCorners(HWND hwnd)
 {
@@ -532,9 +684,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     {
     case WM_CREATE: AddClipboardFormatListener(h); return 0;
     case WM_CLIPBOARDUPDATE:
-        // 只查询格式是否可用，不 Open/Close 剪贴板：少一次系统调用，也不会阻塞其他程序
-        if (IsClipboardFormatAvailable(CF_UNICODETEXT)) ShowToast();
+        // 剪贴板被写入 ≠ 用户复制了：交给 OnClipboardUpdate 做意图与内容校验
+        OnClipboardUpdate();
         return 0;
+    case WM_TIMER:
+        if (w == TIMER_INTENT_POLL) { PollCopyCombo(); return 0; }
+        break;
     case WM_TRAY: if (l == WM_RBUTTONUP) ShowTrayMenu(h); return 0;
     case WM_COMMAND: if (LOWORD(w) == ID_EXIT) DestroyWindow(h); return 0;
     case WM_DESTROY:
@@ -565,6 +720,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     g_hwndMain = CreateWindowExW(0, kWndMain, L"", 0, 0, 0, 0, 0,
                                  HWND_MESSAGE, nullptr, hInst, nullptr);
     if (!g_hwndMain) return 0;
+    // 复制意图的三个信号源：键盘钩子（快捷键）、鼠标钩子（右键菜单）、定时轮询（UIPI 兜底）。
+    // 低层钩子无 DLL 注入，要求安装线程带消息循环（下面即是）。安装失败不致命：
+    // 全部失败时 HasRecentCopyIntent() 会退化为宽松判定，工具仍可用。
+    g_hKeyHook   = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHookProc, g_hInst, 0);
+    g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, g_hInst, 0);
+    SetTimer(g_hwndMain, TIMER_INTENT_POLL, INTENT_POLL_MS, nullptr); // 定时器随主窗口销毁自动清除
     g_hIconTray = CreateTrayIcon(GetSystemMetrics(SM_CXSMICON)); // 优先自绘，失败回退系统图标
     if (g_hIconTray) g_iconOwned = true;
     else g_hIconTray = LoadIconW(nullptr, IDI_APPLICATION);        // 共享图标：不可 DestroyIcon
@@ -581,7 +742,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    // 统一释放：窗口 -> DIB/DC -> 字体 -> 图标
+    // 统一释放：钩子 -> 窗口 -> DIB/DC -> 字体 -> 图标（轮询定时器已随主窗口销毁自动清除）
+    if (g_hKeyHook) { UnhookWindowsHookEx(g_hKeyHook); g_hKeyHook = nullptr; }
+    if (g_hMouseHook) { UnhookWindowsHookEx(g_hMouseHook); g_hMouseHook = nullptr; }
     if (g_toast.hwnd) { DestroyWindow(g_toast.hwnd); g_toast.hwnd = nullptr; }
     ReleaseDib();
     if (g_toast.fText) { DeleteObject(g_toast.fText); g_toast.fText = nullptr; }
