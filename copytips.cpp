@@ -7,11 +7,18 @@
 // 设计要点：单文件零依赖（仅 user32/gdi32/shell32/advapi32）；DWM 圆角用 LoadLibraryW 动态加载，
 // 不新增导入库；弹窗懒创建且全局唯一，重复复制只重置定时器 + 重绘；DIB/DC/字体/托盘图标全部缓存
 // 复用；逐像素 alpha（32bpp 顶向下 DIB + UpdateLayeredWindow）实现平滑圆角与柔和投影。
-// 触发判定：剪贴板「被写入」不等于「用户复制了」（选中即复制的终端、剪贴板管理器、脚本写入都算）。
-// 三个旁证信号任一成立即视为复制意图：① 键盘钩子捕获 Ctrl+C/X/Insert、Shift+Delete；
-// ② 鼠标钩子捕获右键抬起（覆盖右键菜单里的「复制」）；③ 40ms 轮询 GetAsyncKeyState
-// （它读的是整个桌面的物理键状态，不受 UIPI 限制，可兜住管理员窗口里的按键）。
-// 再叠加「写入者是前台进程」与「内容非空」两道校验，才弹提示。
+// 触发判定（2.3.0 两种模式）：
+//   宽松（默认）：剪贴板出现「非空文本且内容与上次提示过的不完全相同」就提示。内容指纹 + 长度 + 500ms
+//                 窗口做去重，因此选中即复制、脚本写入同样会提示——这是 2.3.0 明确采用的产品口径：
+//                 与其去猜「用户到底按没按复制键」，不如只认「剪贴板里确实换了一段新文本」这个可观测事实。
+//   严格（COPYTIPS_MODE=strict）：2.2.1 的意图驱动。三个旁证信号任一成立才算复制意图：
+//                 ① 键盘钩子捕获 Ctrl+C/X/Insert、Shift+Delete；② 鼠标钩子捕获右键抬起（覆盖右键菜单的
+//                 「复制」）；③ 40ms 轮询 GetAsyncKeyState（读整个桌面的物理键状态，不受 UIPI 限制，
+//                 可兜住管理员窗口里的按键）。再叠加「写入者是前台进程」与「内容非空」两道校验。
+// 两种模式的钩子与旁证采样完全相同，strict 只是把判定链换成 2.2.1 那一套，便于 A/B 对照与回退。
+// 诊断日志（2.2.1 起）：环境变量 COPYTIPS_DEBUG / 命令行 /debug、--debug / exe 旁放 copytips.debug
+// 任一命中即开启，逐事件写入 %TEMP%\copytips.log。日志只记录观测值，绝不参与判定；
+// 默认关闭时不采集、不格式化、不写盘（主路径只多一次 ~200 字节的栈清零）。
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601 // AddClipboardFormatListener 等需要 Vista+
 #include <windows.h>
@@ -52,6 +59,18 @@
 #define CLIP_OPEN_TRIES       5     // 打开剪贴板的重试次数（它常被别的进程短暂占用）
 #define CLIP_OPEN_WAIT_MS     10    // 每次重试之间的等待（最多 ~50ms，不能再长：会拖住 UI 线程）
 #define TIMER_INTENT_POLL     2     // 主窗口上的意图轮询定时器 id（TIMER_TOAST=1 属于弹窗窗口）
+
+/* 内容指纹去重（2.3.0 宽松模式）：判定「这次是不是一段没提示过的新文本」 */
+#define CONTENT_DEDUPE_MS  500        // 同一内容在此窗口内重复写入只提示一次
+#define CONTENT_HASH_MAX   (1u << 20) // 参与哈希的最大字符数：超长文本也不让 UI 线程走长循环
+
+/* 诊断日志参数（2.2.1）：只在开关打开时才会用到 */
+#define LOG_MAX_LINE       2048                // 单行上限（宽字符）
+#define LOG_MAX_FORMATS    8                   // 单个事件最多记录的格式数
+#define LOG_HEAD_CHARS     32                  // 文本头截取的字符数
+#define LOG_SCAN_MAX_CHARS (1024u * 1024u)     // 文本长度统计上限：超大剪贴板也不让 UI 线程走长循环
+#define LOG_ROTATE_BYTES   (2 * 1024 * 1024)   // 超过 2 MB 时把旧日志轮转为 copytips.log.1
+#define LOG_FORMAT_RTF     0xC9                // "Rich Text Format"，无标准宏
 
 /* 视觉规格：96 DPI 下的逻辑值，运行时按 DPI 缩放 */
 #define L_PILL_H      32  // 胶囊高度
@@ -100,6 +119,28 @@ static DWORD     g_lastMenuIntentMs = 0;       // 最近一次右键抬起的 Ge
 static DWORD     g_lastClipSeq      = 0;       // 已处理过的剪贴板序列号
 static bool      g_pollWasCopyCombo = false;   // 轮询用：上一次采样是否处于复制组合键（边沿检测）
 static DWORD     g_intentWindowMs   = 0;       // 懒计算：本地 400ms / 远程桌面 1500ms
+
+// 诊断日志状态（启动时算一次）与鼠标旁证（只记录，不参与判定）
+// 大缓冲故意不写 `= {}`：静态存储期本身就零初始化，放 .bss 才不会让 exe 白胖 16 KB。
+static bool      g_logOn        = false;                 // 默认关闭：关闭时不采样、不格式化、不写盘
+static wchar_t   g_logPath[MAX_PATH];                    // %TEMP%\copytips.log
+static wchar_t   g_logBody[LOG_MAX_LINE];                // 复用缓冲：只在 UI 线程写，无需同步
+static wchar_t   g_logLine[LOG_MAX_LINE];
+static char      g_logUtf8[LOG_MAX_LINE * 4];
+static DWORD     g_lastLUpMs    = 0;                     // 最近一次左键抬起；0 = 从未
+static DWORD     g_lastRUpMs    = 0;                     // 最近一次右键抬起；0 = 从未
+static bool      g_menuModeSeen = false;                 // 最近一次抬起时前台线程是否处于菜单模式
+// 仅日志专用的一对时间戳：判定用的 g_last*Ms 在弹窗时会被清零，那会让
+// 「唯一真的弹了的那些行」看不到是哪个信号触发的；这两份永不清零，只被日志读取。
+static DWORD     g_logIntentSeenMs = 0;                  // 最近一次复制快捷键的 GetTickCount()；0 = 从未
+static DWORD     g_logMenuSeenMs   = 0;                  // 最近一次右键抬起的 GetTickCount()；0 = 从未
+
+// 触发模式（2.3.0）：启动时由环境变量决定一次，运行期不再变化
+// 宽松模式的内容去重状态：hash + len 一起比较，避免不同文本撞哈希后互相吞掉提示
+static ULONGLONG g_lastTextHash = 0;                     // 上次提示过的文本内容指纹（0 = 从未）
+static unsigned  g_lastTextLen  = 0;                     // 与之配套的长度，防哈希碰撞误伤
+static DWORD     g_lastTextMs   = 0;                     // 上次提示的时刻（仅宽松模式用于去重窗口）
+static bool      g_strictMode   = false;                 // 启动时由 COPYTIPS_MODE=strict 决定；默认宽松
 
 // 弹窗状态：窗口 + DIB 缓存 + 字体缓存，全部懒创建并复用
 struct ToastState
@@ -452,6 +493,354 @@ static void ShowToast()
     ShowWindow(g_toast.hwnd, SW_SHOWNOACTIVATE);
 }
 
+/* ---------------- 诊断日志（2.2.1：只观测，不参与判定） ---------------- */
+// 目标：先把「微信里仅选中文字也弹窗」确诊为「微信确实写了剪贴板」还是「意图信号误触发」。
+// 因此这里只做观测与落盘：所有字段都是当时的实测值，决定弹不弹的逻辑一行都没动。
+enum Decision
+{
+    DECISION_SHOW = 0,
+    DECISION_SKIP_SEQ,      // 序列号重复：同一次写入的重复通知
+    DECISION_SKIP_NOINTENT, // 没有复制意图（键盘钩子 / 右键窗 / 轮询都没命中）
+    DECISION_SKIP_OWNER,    // 写入者不是前台进程
+    DECISION_SKIP_EMPTY,    // 无 CF_UNICODETEXT，或文本为空
+    DECISION_SKIP_CLIPBUSY, // 5×10ms 都没能打开剪贴板
+    DECISION_SKIP_DUPCONTENT // 宽松模式：与上次提示过的内容相同，且落在 CONTENT_DEDUPE_MS 窗口内
+};
+
+// 一次剪贴板读取采到的信息（日志关闭时不会填充，也不会多花任何开销）
+struct ClipInfo
+{
+    bool openFailed = false;                    // OpenClipboard 重试耗尽（日志用来区分 SKIP_CLIPBUSY）
+    int formatCount = 0;                        // 实际枚举到的格式数（最多 LOG_MAX_FORMATS）
+    DWORD formats[LOG_MAX_FORMATS] = {};        // 格式号
+    unsigned textLen = 0;                       // 文本字符数（受 LOG_SCAN_MAX_CHARS 限制）
+    wchar_t head[LOG_HEAD_CHARS * 2 + 16] = {}; // 已转义的前 LOG_HEAD_CHARS 个字符
+};
+
+static const wchar_t* DecisionName(Decision d)
+{
+    switch (d)
+    {
+    case DECISION_SHOW:          return L"SHOW";
+    case DECISION_SKIP_SEQ:      return L"SKIP_SEQ";
+    case DECISION_SKIP_NOINTENT: return L"SKIP_NOINTENT";
+    case DECISION_SKIP_OWNER:    return L"SKIP_OWNER";
+    case DECISION_SKIP_EMPTY:    return L"SKIP_EMPTY";
+    case DECISION_SKIP_CLIPBUSY: return L"SKIP_CLIPBUSY";
+    case DECISION_SKIP_DUPCONTENT: return L"SKIP_DUPCONTENT";
+    }
+    return L"?";
+}
+
+// 开关一：环境变量存在且值不为 "0"（含「存在但为空」的情况）
+static bool EnvSwitchOn()
+{
+    wchar_t v[32] = {};
+    const DWORD cap = (DWORD)(sizeof(v) / sizeof(v[0]));
+    SetLastError(ERROR_SUCCESS);
+    const DWORD n = GetEnvironmentVariableW(L"COPYTIPS_DEBUG", v, cap);
+    if (n >= cap) return true;                           // 值比缓冲还长：必然不是 "0"
+    if (n == 0) return GetLastError() == ERROR_SUCCESS;  // 变量存在但为空 -> 视为开启
+    if (n == 1 && v[0] == L'0') return false;            // 显式 "0" -> 关闭
+    return true;
+}
+
+// 开关二：命令行含 /debug 或 --debug（不区分大小写）。
+// 只认「参数起始位置」，否则 exe 放在 .../mydebug/ 这类目录里会被误开。
+static bool CmdLineSwitchOn()
+{
+    const wchar_t* cmd = GetCommandLineW();
+    if (!cmd) return false;
+    static const wchar_t kSlash[] = L"/debug";
+    static const wchar_t kDash[] = L"--debug";
+    const size_t slashLen = (sizeof(kSlash) / sizeof(kSlash[0])) - 1;
+    const size_t dashLen = (sizeof(kDash) / sizeof(kDash[0])) - 1;
+    for (const wchar_t* p = cmd; *p; ++p)
+    {
+        if (p != cmd && p[-1] != L' ' && p[-1] != L'\t') continue; // 不是参数开头
+        if (_wcsnicmp(p, kSlash, slashLen) == 0) return true;
+        if (_wcsnicmp(p, kDash, dashLen) == 0) return true;
+    }
+    return false;
+}
+
+// 开关三：exe 同目录存在 copytips.debug
+static bool DebugFileOn()
+{
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return false;
+    static const wchar_t kName[] = L"copytips.debug";
+    const size_t dirLen = (size_t)(slash - path) + 1; // 含结尾反斜杠
+    const size_t nameLen = sizeof(kName) / sizeof(kName[0]); // 含结尾 0
+    if (dirLen + nameLen > MAX_PATH) return false;
+    wmemcpy(path + dirLen, kName, nameLen);
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+// 启动时调用一次：三路开关任一命中即开启，并把日志路径缓存下来
+static void InitDebugLog()
+{
+    g_logOn = EnvSwitchOn() || CmdLineSwitchOn() || DebugFileOn();
+    if (!g_logOn) return;
+    wchar_t dir[MAX_PATH] = {};
+    const DWORD n = GetTempPathW(MAX_PATH, dir); // 末尾自带反斜杠
+    static const wchar_t kName[] = L"copytips.log";
+    const size_t nameLen = sizeof(kName) / sizeof(kName[0]);
+    if (n == 0 || n >= MAX_PATH || (size_t)n + nameLen > MAX_PATH) { g_logOn = false; return; }
+    wmemcpy(dir + n, kName, nameLen);
+    wmemcpy(g_logPath, dir, (size_t)n + nameLen);
+}
+
+// 追加一行：新建文件先写 UTF-8 BOM（记事本里中文才不乱码），超过 2 MB 先把旧文件轮转为 .1。
+// 全程 best-effort：任何一步失败都静默返回，绝不抛异常、绝不影响主流程。
+static void LogFlush(const wchar_t* line)
+{
+    if (!g_logOn || !line || !*line) return;
+    // 1) 轮转：必须在打开之前判断，否则会把旧内容带进新文件
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (GetFileAttributesExW(g_logPath, GetFileExInfoStandard, &fad)
+            && (fad.nFileSizeHigh != 0 || fad.nFileSizeLow > (DWORD)LOG_ROTATE_BYTES))
+    {
+        wchar_t bak[MAX_PATH] = {};
+        const size_t n = wcslen(g_logPath);
+        static const wchar_t kSuffix[] = L".1";
+        const size_t suffixLen = sizeof(kSuffix) / sizeof(kSuffix[0]);
+        if (n + suffixLen <= MAX_PATH)
+        {
+            wmemcpy(bak, g_logPath, n);
+            wmemcpy(bak + n, kSuffix, suffixLen);
+            MoveFileExW(g_logPath, bak, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+    // 2) 追加写入（用完即关：日志量极小，不长期占句柄）
+    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size = {};
+    if (GetFileSizeEx(h, &size) && size.QuadPart == 0)
+    {
+        const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+        DWORD written = 0;
+        WriteFile(h, bom, sizeof(bom), &written, nullptr);
+    }
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, g_logUtf8, (int)sizeof(g_logUtf8),
+                                          nullptr, nullptr);
+    if (bytes > 1) // 返回值含结尾 0，写入时去掉
+    {
+        DWORD written = 0;
+        WriteFile(h, g_logUtf8, (DWORD)(bytes - 1), &written, nullptr);
+        WriteFile(h, "\r\n", 2, &written, nullptr);
+    }
+    CloseHandle(h);
+}
+
+// 极简字符串构造器：本项目不引入 CRT 的 printf 引擎（未知格式串会连带拉进浮点格式化代码，
+// exe 会从 118 KB 涨到 157 KB），日志行全部手工拼接，每一步都做上界检查。
+struct LogBuf
+{
+    wchar_t* p = nullptr;
+    size_t cap = 0; // 含结尾 0
+    size_t len = 0;
+};
+
+static void BufInit(LogBuf& b, wchar_t* buf, size_t cch)
+{
+    b.p = buf; b.cap = cch; b.len = 0;
+    if (cch > 0) buf[0] = 0;
+}
+
+static void BufCh(LogBuf& b, wchar_t c)
+{
+    if (!b.p || b.len + 1 >= b.cap) return; // 满了就丢弃剩余内容，绝不越界写
+    b.p[b.len++] = c;
+    b.p[b.len] = 0;
+}
+
+static void BufStr(LogBuf& b, const wchar_t* s)
+{
+    if (!s) return;
+    while (*s) BufCh(b, *s++);
+}
+
+// 无符号十进制，不足 minDigits 位左侧补 0
+static void BufUint(LogBuf& b, unsigned v, int minDigits)
+{
+    wchar_t tmp[12] = {};
+    int n = 0;
+    do { tmp[n++] = (wchar_t)(L'0' + (v % 10u)); v /= 10u; } while (v != 0 && n < 11);
+    for (; n < minDigits && n < 11; ++n) tmp[n] = L'0';
+    while (n > 0) BufCh(b, tmp[--n]);
+}
+
+// 无符号十六进制（0xC9 这类非标准格式号）
+static void BufHex(LogBuf& b, unsigned v, int minDigits)
+{
+    static const wchar_t kDigits[] = L"0123456789ABCDEF";
+    wchar_t tmp[12] = {};
+    int n = 0;
+    do { tmp[n++] = kDigits[v & 0xFu]; v >>= 4; } while (v != 0 && n < 11);
+    for (; n < minDigits && n < 11; ++n) tmp[n] = L'0';
+    BufCh(b, L'0'); BufCh(b, L'x');
+    while (n > 0) BufCh(b, tmp[--n]);
+}
+
+// 无符号 64 位十六进制，不足 minDigits 位左侧补 0，**不带 0x 前缀**（日志里按 %016llX 的口径写）
+static void BufHex64(LogBuf& b, ULONGLONG v, int minDigits)
+{
+    static const wchar_t kDigits[] = L"0123456789ABCDEF";
+    wchar_t tmp[17] = {};
+    int n = 0;
+    do { tmp[n++] = kDigits[(unsigned)(v & 0xFull)]; v >>= 4; } while (v != 0 && n < 16);
+    for (; n < minDigits && n < 16; ++n) tmp[n] = L'0';
+    while (n > 0) BufCh(b, tmp[--n]);
+}
+
+// [本地时间.毫秒] + 正文，然后落盘
+static void LogWriteBody(const wchar_t* body)
+{
+    if (!g_logOn || !body) return;
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    LogBuf b;
+    BufInit(b, g_logLine, LOG_MAX_LINE);
+    BufCh(b, L'[');
+    BufUint(b, (unsigned)st.wYear, 4);   BufCh(b, L'-');
+    BufUint(b, (unsigned)st.wMonth, 2);  BufCh(b, L'-');
+    BufUint(b, (unsigned)st.wDay, 2);    BufCh(b, L' ');
+    BufUint(b, (unsigned)st.wHour, 2);   BufCh(b, L':');
+    BufUint(b, (unsigned)st.wMinute, 2); BufCh(b, L':');
+    BufUint(b, (unsigned)st.wSecond, 2); BufCh(b, L'.');
+    BufUint(b, (unsigned)st.wMilliseconds, 3);
+    BufStr(b, L"] ");
+    BufStr(b, body);
+    LogFlush(g_logLine);
+}
+
+// 启动行：钩子成败是排查「权限 / UIPI」类问题的第一手材料，所以在两个钩子都装好之后才写
+static void LogStartup()
+{
+    if (!g_logOn) return;
+    LogBuf b;
+    BufInit(b, g_logBody, LOG_MAX_LINE);
+    BufStr(b, L"[startup] ver=" APP_VERSION_WSTR L" mode=");
+    BufStr(b, g_strictMode ? L"strict" : L"loose"); // A/B 对照时，日志第一行就要能看出用的是哪套判定
+    BufStr(b, L" dpi=");
+    BufUint(b, (unsigned)g_dpi, 1);
+    BufStr(b, L" rdp=");
+    BufUint(b, GetSystemMetrics(SM_REMOTESESSION) ? 1u : 0u, 1);
+    BufStr(b, L" keyhook=");
+    BufUint(b, g_hKeyHook ? 1u : 0u, 1);
+    BufStr(b, L" mousehook=");
+    BufUint(b, g_hMouseHook ? 1u : 0u, 1);
+    BufStr(b, L" debug=1 log=");
+    BufStr(b, g_logPath);
+    LogWriteBody(g_logBody);
+}
+
+// 距某意图时间戳的毫秒差；该时间戳为 0（从未）时写 -1
+static void FmtDelta(wchar_t* out, size_t cch, DWORD ts)
+{
+    LogBuf b;
+    BufInit(b, out, cch);
+    if (ts == 0) { BufStr(b, L"-1"); return; }
+    BufUint(b, (unsigned)(GetTickCount() - ts), 1); // 无符号差，跨回绕正确
+}
+
+// 窗口 -> "类名#pid"；无窗口写 "none#0"
+static void FmtWin(wchar_t* out, size_t cch, HWND w)
+{
+    LogBuf b;
+    BufInit(b, out, cch);
+    if (!w) { BufStr(b, L"none#0"); return; }
+    wchar_t cls[64] = {};
+    if (GetClassNameW(w, cls, (int)(sizeof(cls) / sizeof(cls[0]))) <= 0) cls[0] = 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    BufStr(b, cls[0] ? cls : L"?");
+    BufCh(b, L'#');
+    BufUint(b, (unsigned)pid, 1);
+}
+
+// 格式号列表：1:TEXT / 13:UNICODETEXT / 15:HDROP / 16:LOCALE / 0xC9:RTF，其余只写数字
+static void FmtFormats(wchar_t* out, size_t cch, const ClipInfo& info)
+{
+    LogBuf b;
+    BufInit(b, out, cch);
+    if (info.formatCount <= 0) { BufStr(b, L"-"); return; }
+    for (int i = 0; i < info.formatCount; ++i)
+    {
+        if (i > 0) BufCh(b, L',');
+        const DWORD f = info.formats[i];
+        if (f == (DWORD)LOG_FORMAT_RTF) BufHex(b, (unsigned)f, 2); // 非标准宏，写十六进制便于对照
+        else                            BufUint(b, (unsigned)f, 1);
+        if (f == (DWORD)CF_TEXT)             BufStr(b, L":TEXT");
+        else if (f == (DWORD)CF_UNICODETEXT) BufStr(b, L":UNICODETEXT");
+        else if (f == (DWORD)CF_HDROP)       BufStr(b, L":HDROP");
+        else if (f == (DWORD)CF_LOCALE)      BufStr(b, L":LOCALE");
+        else if (f == (DWORD)LOG_FORMAT_RTF) BufStr(b, L":RTF");
+    }
+}
+
+// 文本头：\r \n \t 与双引号转义；超过 32 字符（或被扫描上限截断）补 ...
+static void FmtHead(wchar_t* out, size_t cch, const wchar_t* text, size_t len)
+{
+    if (cch == 0) return;
+    size_t o = 0;
+    out[0] = 0;
+    const size_t take = (len < (size_t)LOG_HEAD_CHARS) ? len : (size_t)LOG_HEAD_CHARS;
+    for (size_t i = 0; i < take && o + 3 < cch; ++i)
+    {
+        switch (text[i])
+        {
+        case L'\r': out[o++] = L'\\'; out[o++] = L'r'; break;
+        case L'\n': out[o++] = L'\\'; out[o++] = L'n'; break;
+        case L'\t': out[o++] = L'\\'; out[o++] = L't'; break;
+        case L'"':  out[o++] = L'\\'; out[o++] = L'"'; break;
+        default:    out[o++] = text[i]; break;
+        }
+    }
+    if (len > take && o + 3 < cch) { out[o++] = L'.'; out[o++] = L'.'; out[o++] = L'.'; }
+    out[o] = 0;
+}
+
+// 一行事件记录。字段全部是当时的实测值，decision 反映真实分支（不是写死的）。
+static void LogClipboardEvent(DWORD seq, const ClipInfo& info, Decision d, ULONGLONG hash)
+{
+    if (!g_logOn) return;
+    wchar_t dtKey[16] = {}, dtMenu[16] = {}, dtLUp[16] = {}, dtRUp[16] = {};
+    wchar_t owner[96] = {}, fg[96] = {}, fmts[160] = {};
+    // dtKey / dtMenu 读的是「仅日志、永不清零」的那一对副本：判定用的时间戳在弹窗时会被清零，
+    // 若直接读它，SHOW 行（唯一真的弹了的行）永远只会显示 -1。
+    FmtDelta(dtKey, sizeof(dtKey) / sizeof(dtKey[0]), g_logIntentSeenMs);
+    FmtDelta(dtMenu, sizeof(dtMenu) / sizeof(dtMenu[0]), g_logMenuSeenMs);
+    FmtDelta(dtLUp, sizeof(dtLUp) / sizeof(dtLUp[0]), g_lastLUpMs);
+    FmtDelta(dtRUp, sizeof(dtRUp) / sizeof(dtRUp[0]), g_lastRUpMs);
+    const HWND ownerWnd = GetClipboardOwner();
+    FmtWin(owner, sizeof(owner) / sizeof(owner[0]), ownerWnd);
+    FmtWin(fg, sizeof(fg) / sizeof(fg[0]), GetForegroundWindow());
+    FmtFormats(fmts, sizeof(fmts) / sizeof(fmts[0]), info);
+
+    LogBuf b;
+    BufInit(b, g_logBody, LOG_MAX_LINE);
+    BufStr(b, L"seq=");         BufUint(b, (unsigned)seq, 1);
+    BufStr(b, L" dtKey=");      BufStr(b, dtKey);
+    BufStr(b, L" dtMenu=");     BufStr(b, dtMenu);
+    BufStr(b, L" dtLUp=");      BufStr(b, dtLUp);
+    BufStr(b, L" dtRUp=");      BufStr(b, dtRUp);
+    BufStr(b, L" mFlag=");      BufStr(b, g_menuModeSeen ? L"menu" : L"nomenu");
+    BufStr(b, L" owner=");      BufStr(b, owner);
+    BufStr(b, L" ownerVis=");   BufUint(b, IsWindowVisible(ownerWnd) ? 1u : 0u, 1); // 只记录，不参与判定
+    BufStr(b, L" fg=");         BufStr(b, fg);
+    BufStr(b, L" fmt=");        BufStr(b, fmts);
+    BufStr(b, L" hash=");       BufHex64(b, hash, 16); // 内容指纹：与下文 len 一起构成去重键
+    BufStr(b, L" len=");        BufUint(b, info.textLen, 1);
+    BufStr(b, L" head=\"");     BufStr(b, info.head);
+    BufStr(b, L"\" decision="); BufStr(b, DecisionName(d));
+    LogWriteBody(g_logBody);
+}
+
 /* ---------------- 复制意图判定 ---------------- */
 // 为什么需要这一层：WM_CLIPBOARDUPDATE 只能说明「剪贴板被某个进程写入」，并不能说明「用户复制了」。
 // 开启「选中即复制」的终端/词典/浏览器扩展、剪贴板管理器与云同步、输入法、脚本 Set-Clipboard
@@ -482,7 +871,11 @@ static LRESULT CALLBACK KeyHookProc(int code, WPARAM w, LPARAM l)
     if (code == HC_ACTION && (w == WM_KEYDOWN || w == WM_SYSKEYDOWN))
     {
         const KBDLLHOOKSTRUCT* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(l);
-        if (kb && IsCopyCombo(*kb)) g_lastIntentMs = GetTickCount();
+        if (kb && IsCopyCombo(*kb))
+        {
+            g_lastIntentMs = GetTickCount();
+            g_logIntentSeenMs = g_lastIntentMs; // 仅日志，永不清零
+        }
     }
     return CallNextHookEx(g_hKeyHook, code, w, l);
 }
@@ -491,7 +884,29 @@ static LRESULT CALLBACK KeyHookProc(int code, WPARAM w, LPARAM l)
 //（Win11/Office/Chrome 的自绘菜单都不是传统 #32768，按类名判断会漏；按动作时间判断则全都覆盖）
 static LRESULT CALLBACK MouseHookProc(int code, WPARAM w, LPARAM l)
 {
-    if (code == HC_ACTION && w == WM_RBUTTONUP) g_lastMenuIntentMs = GetTickCount();
+    if (code == HC_ACTION && (w == WM_RBUTTONUP || w == WM_LBUTTONUP))
+    {
+        const DWORD now = GetTickCount(); // 判定用的时间戳：与 2.2.0 完全一致（仍在抬起瞬间取值）
+        if (w == WM_RBUTTONUP)
+        {
+            g_lastMenuIntentMs = now; g_lastRUpMs = now;
+            g_logMenuSeenMs = g_lastMenuIntentMs; // 仅日志，永不清零
+        }
+        else { g_lastLUpMs = now; }
+        // 诊断旁证（只记录，不参与判定）：抬起瞬间前台线程是否处于某种菜单模式。
+        // 日志关闭时连这次跨线程查询都不做，保持 2.2.0 的开销。
+        if (g_logOn)
+        {
+            bool menu = false;
+            const HWND fg = GetForegroundWindow();
+            const DWORD tid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+            GUITHREADINFO gti = {};
+            gti.cbSize = sizeof(gti);
+            if (tid != 0 && GetGUIThreadInfo(tid, &gti))
+                menu = (gti.flags & (GUI_INMENUMODE | GUI_SYSTEMMENUMODE | GUI_POPUPMENUMODE)) != 0;
+            g_menuModeSeen = menu; // 取不到就保持 nomenu
+        }
+    }
     return CallNextHookEx(g_hMouseHook, code, w, l);
 }
 
@@ -507,7 +922,11 @@ static void PollCopyCombo()
                                (GetAsyncKeyState(vkX) & 0x8000) != 0 ||
                                (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0))
                      || (shift && (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0);
-    if (hit && !g_pollWasCopyCombo) g_lastIntentMs = GetTickCount();
+    if (hit && !g_pollWasCopyCombo)
+    {
+        g_lastIntentMs = GetTickCount();
+        g_logIntentSeenMs = g_lastIntentMs; // 仅日志，永不清零
+    }
     g_pollWasCopyCombo = hit;
 }
 
@@ -529,14 +948,43 @@ static bool HasRecentCopyIntent()
     return false;
 }
 
-// 剪贴板里是否真有非空文本：真正打开并读取，而不是只探测格式
-static bool ClipboardHasText()
+// 剪贴板里是否真有非空文本：真正打开并读取，而不是只探测格式。
+// info == nullptr  -> 与 2.2.0 完全相同的浅读：只看首字符，O(1)，不枚举格式、不读文本头。
+// info != nullptr  -> 日志开启：在同一次 OpenClipboard 里顺带采集格式列表与文本头。
+// 所有路径（成功 / 失败 / 早退）都必须 GlobalUnlock（仅在 GlobalLock 成功时）并 CloseClipboard，
+// 否则会锁死全系统的剪贴板。
+static bool ClipboardHasText(ClipInfo* info)
 {
     for (int i = 0; i < CLIP_OPEN_TRIES; ++i)
     {
         if (!OpenClipboard(nullptr)) { Sleep(CLIP_OPEN_WAIT_MS); continue; } // 被占用：小步退避
         bool hasText = false;
-        if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+        if (info)
+        {
+            // 1) 格式列表：EnumClipboardFormats 从 0 开始迭代，最多记 LOG_MAX_FORMATS 个
+            UINT fmt = 0;
+            while (info->formatCount < LOG_MAX_FORMATS && (fmt = EnumClipboardFormats(fmt)) != 0)
+                info->formats[info->formatCount++] = fmt;
+            // 2) 文本：非空判定与浅读同义（wcsnlen 停在 0，等价于「首字符 != 0」），
+            //    只是额外记下长度与前 32 字符；扫描长度受缓冲区大小与 LOG_SCAN_MAX_CHARS 双重限制。
+            if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+            {
+                HANDLE data = GetClipboardData(CF_UNICODETEXT);
+                const wchar_t* text = data ? static_cast<const wchar_t*>(GlobalLock(data)) : nullptr;
+                if (text)
+                {
+                    SIZE_T maxChars = GlobalSize(data) / sizeof(wchar_t); // 缓冲区上界，绝不越界读
+                    if (maxChars == 0) maxChars = 1;
+                    if (maxChars > (SIZE_T)LOG_SCAN_MAX_CHARS) maxChars = (SIZE_T)LOG_SCAN_MAX_CHARS;
+                    const size_t n = wcsnlen(text, maxChars);
+                    hasText = (n > 0);
+                    info->textLen = (unsigned)n;
+                    FmtHead(info->head, sizeof(info->head) / sizeof(info->head[0]), text, n);
+                    GlobalUnlock(data); // 拿到就一定要解锁，否则句柄被永久锁住
+                }
+            }
+        }
+        else if (IsClipboardFormatAvailable(CF_UNICODETEXT))
         {
             HANDLE data = GetClipboardData(CF_UNICODETEXT);
             const wchar_t* text = data ? static_cast<const wchar_t*>(GlobalLock(data)) : nullptr;
@@ -549,7 +997,69 @@ static bool ClipboardHasText()
         CloseClipboard(); // 无论读取成功与否都必须关闭，否则整个系统的剪贴板会被锁死
         return hasText;
     }
-    return false; // 5×10ms 后仍被占用：本次不提示（宁可漏报，也绝不误报）
+    if (info) info->openFailed = true; // 5×10ms 仍被占用：本次不提示（宁可漏报，也绝不误报）
+    return false;
+}
+
+// 宽松模式的判定读取：在一次 OpenClipboard 内完成「格式列表（仅日志）+ 非空文本 + 内容指纹」。
+// 与 ClipboardHasText 的差别只在「要不要算指纹」，重试节奏、扫描上限、句柄纪律完全一致。
+// info == nullptr 表示日志关闭：只算指纹，不枚举格式、不读文本头（不产生任何日志相关的开销）。
+// 所有路径（成功 / 失败 / 空文本）都恰好 GlobalUnlock 一次（仅在 GlobalLock 成功时）并 CloseClipboard 一次。
+static bool ReadClipboardText(ULONGLONG* hash, unsigned* len, ClipInfo* info)
+{
+    if (hash) *hash = 0;
+    if (len)  *len = 0;
+    for (int i = 0; i < CLIP_OPEN_TRIES; ++i)
+    {
+        if (!OpenClipboard(nullptr)) { Sleep(CLIP_OPEN_WAIT_MS); continue; } // 被占用：小步退避
+        bool hasText = false;
+        if (info)
+        {
+            // 1) 格式列表：与 2.2.1 的采集口径完全一致（EnumClipboardFormats 从 0 开始迭代）
+            UINT fmt = 0;
+            while (info->formatCount < LOG_MAX_FORMATS && (fmt = EnumClipboardFormats(fmt)) != 0)
+                info->formats[info->formatCount++] = fmt;
+        }
+        // 2) 文本：长度 / 头 32 字符 / 内容指纹，全部在同一次打开里取完
+        if (IsClipboardFormatAvailable(CF_UNICODETEXT))
+        {
+            HANDLE data = GetClipboardData(CF_UNICODETEXT);
+            const wchar_t* text = data ? static_cast<const wchar_t*>(GlobalLock(data)) : nullptr;
+            if (text)
+            {
+                SIZE_T maxChars = GlobalSize(data) / sizeof(wchar_t); // 缓冲区上界，绝不越界读
+                if (maxChars == 0) maxChars = 1;
+                if (maxChars > (SIZE_T)LOG_SCAN_MAX_CHARS) maxChars = (SIZE_T)LOG_SCAN_MAX_CHARS;
+                const size_t n = wcsnlen(text, maxChars);
+                if (n > 0)
+                {
+                    // FNV-1a 64：按 UTF-16 code unit 逐 2 字节（低字节在前）累积，最多 CONTENT_HASH_MAX 个字符。
+                    // 超长文本只有头部参与指纹：两段百万字符以上的文本若仅尾部不同会被判为同一内容。
+                    // 这个取舍是刻意的——剪贴板事件跑在 UI 线程上，绝不能在这里走长循环。
+                    const size_t hmax = (n < (size_t)CONTENT_HASH_MAX) ? n : (size_t)CONTENT_HASH_MAX;
+                    ULONGLONG h = 14695981039346656037ULL; // FNV-1a 64 offset basis
+                    for (size_t k = 0; k < hmax; ++k)
+                    {
+                        h ^= (ULONGLONG)((unsigned)text[k] & 0xFFu);        h *= 1099511628211ULL; // prime
+                        h ^= (ULONGLONG)(((unsigned)text[k] >> 8) & 0xFFu); h *= 1099511628211ULL;
+                    }
+                    if (hash) *hash = h;
+                    if (len)  *len  = (unsigned)n;
+                    if (info)
+                    {
+                        info->textLen = (unsigned)n;
+                        FmtHead(info->head, sizeof(info->head) / sizeof(info->head[0]), text, n);
+                    }
+                    hasText = true;
+                }
+                GlobalUnlock(data); // 拿到就一定要解锁，否则句柄被永久锁住
+            }
+        }
+        CloseClipboard(); // 无论读取成功与否都必须关闭，否则整个系统的剪贴板会被锁死
+        return hasText;
+    }
+    if (info) info->openFailed = true; // 5×10ms 仍被占用：本次不提示（宁可漏报，也绝不误报）
+    return false;
 }
 
 // 写入者必须是前台进程：云剪贴板同步、输入法、剪贴板管理器的程序化写入，owner 都不是前台进程。
@@ -567,18 +1077,60 @@ static bool ClipboardOwnerIsForeground()
     return pidOwner == pidFg;
 }
 
-// WM_CLIPBOARDUPDATE 的统一入口：去重 -> 意图 -> 写入者 -> 内容 -> 提示
+// 触发模式：只有 COPYTIPS_MODE=strict 才是严格模式（2.2.1 的意图驱动），其它任何值 / 未设置都走宽松。
+// 只读 16 个字符就够区分 "strict"，不会被异常长的环境变量拖住启动。
+static void InitPromptMode()
+{
+    wchar_t buf[16] = {};
+    const DWORD n = GetEnvironmentVariableW(L"COPYTIPS_MODE", buf, 16);
+    g_strictMode = (n == 6 && _wcsicmp(buf, L"strict") == 0); // 其它任何值/未设置 = 宽松
+}
+
+// WM_CLIPBOARDUPDATE 的统一入口。两种模式共用同一段骨架：序列号去重 -> 读内容 -> 各自的否决条件 -> 提示。
+//   宽松（默认）：内容非空、且与上次提示过的内容不同（或已过 CONTENT_DEDUPE_MS）就提示。
+//   严格（strict）：去重 -> 意图 -> 写入者 -> 内容，与 2.2.1 逐条一致。
+// 日志仍然只是「算出 decision 后写一行」，关闭时这一步整体不存在。
 static void OnClipboardUpdate()
 {
     const DWORD seq = GetClipboardSequenceNumber(); // 每次写入 +1，用于丢弃重复通知（0 = 取不到，不参与比较）
-    if (seq != 0 && seq == g_lastClipSeq) return;
-    g_lastClipSeq = seq;
-    if (!HasRecentCopyIntent()) return;        // 没按复制键、也没刚用过右键菜单 -> 静默
-    if (!ClipboardOwnerIsForeground()) return; // 后台程序写入（云剪贴板 / 输入法 / 管理器）-> 静默
-    if (!ClipboardHasText()) return;           // 空写入 / 非文本 -> 静默
-    g_lastIntentMs = 0;                        // 消费掉这次意图：同一窗口内的后续写入不再二次弹窗
-    g_lastMenuIntentMs = 0;
-    ShowToast();
+    const bool dup = (seq != 0 && seq == g_lastClipSeq);
+    if (!dup) g_lastClipSeq = seq; // 与 2.2.0 相同：只在非重复时更新（重复值本来就相等）
+
+    Decision d = DECISION_SHOW;
+    ClipInfo info;         // 只在日志开启时被填充
+    bool clipRead = false; // 本次事件是否已经读过剪贴板（保证每个事件最多 OpenClipboard 一次）
+    ULONGLONG h = 0;       // 内容指纹（宽松模式判重用；提到函数作用域，SHOW 时要用它更新去重状态）
+    unsigned len = 0;      // 与指纹配套的长度，防不同文本撞哈希
+
+    if (dup) d = DECISION_SKIP_SEQ;
+    else
+    {
+        clipRead = true;
+        if (!ReadClipboardText(&h, &len, g_logOn ? &info : nullptr))
+            d = (g_logOn && info.openFailed) ? DECISION_SKIP_CLIPBUSY : DECISION_SKIP_EMPTY;
+        else if (g_strictMode && !HasRecentCopyIntent())        d = DECISION_SKIP_NOINTENT;
+        else if (g_strictMode && !ClipboardOwnerIsForeground()) d = DECISION_SKIP_OWNER;
+        else if (!g_strictMode && g_lastTextMs != 0 && len == g_lastTextLen && h == g_lastTextHash &&
+                 (DWORD)(GetTickCount() - g_lastTextMs) <= (DWORD)CONTENT_DEDUPE_MS)
+            d = DECISION_SKIP_DUPCONTENT; // 同一内容在去重窗口内被重复写入：只提示一次
+    }
+
+    if (d == DECISION_SHOW)
+    {
+        // 宽松模式去重：记住「这次提示的是什么内容、什么时候提示的」；严格模式下这三行只是无害的旁路记录
+        g_lastTextHash = h; g_lastTextLen = len; g_lastTextMs = GetTickCount();
+        g_lastIntentMs = 0;     // 消费掉这次意图：同一窗口内的后续写入不再二次弹窗
+        g_lastMenuIntentMs = 0;
+    }
+    if (g_logOn)
+    {
+        // 早退路径（重复通知）在判定链里根本不碰剪贴板；这里为定位问题补读一次，
+        // 只读、立即关闭，结果不参与任何判定，且每个事件仍只 OpenClipboard 一次。
+        // 注意：日志取的是 g_log*SeenMs（永不清零），所以放在清零之后也不会丢时间差。
+        if (!clipRead) ClipboardHasText(&info);
+        LogClipboardEvent(seq, info, d, h);
+    }
+    if (d == DECISION_SHOW) ShowToast();
 }
 
 /* ---------------- DWM 圆角（动态加载，不新增导入库） ---------------- */
@@ -709,6 +1261,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     // 故意不用 per-monitor v2：资源对话框在 PMv2 下不会自动缩放，会带来额外复杂度。
     SetProcessDPIAware();
     RefreshDpi(); g_hInst = hInst;
+    InitDebugLog(); // 诊断日志开关只在启动时算一次并缓存；关闭时不采样、不格式化、不写盘，只剩一次 ~200 B 栈清零
+    InitPromptMode(); // 触发模式同理：只在启动时读一次 COPYTIPS_MODE，运行期不再变化
     // 两个窗口类各注册一次（旧实现在每次复制时都重复注册弹窗类）
     WNDCLASSEXW wc = { sizeof(wc), 0, MainProc, 0, 0, hInst,
                        nullptr, nullptr, nullptr, nullptr, kWndMain, nullptr };
@@ -726,6 +1280,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     g_hKeyHook   = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHookProc, g_hInst, 0);
     g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, g_hInst, 0);
     SetTimer(g_hwndMain, TIMER_INTENT_POLL, INTENT_POLL_MS, nullptr); // 定时器随主窗口销毁自动清除
+    LogStartup(); // 诊断日志打开时写一行启动信息（关闭时该函数立刻返回）
     g_hIconTray = CreateTrayIcon(GetSystemMetrics(SM_CXSMICON)); // 优先自绘，失败回退系统图标
     if (g_hIconTray) g_iconOwned = true;
     else g_hIconTray = LoadIconW(nullptr, IDI_APPLICATION);        // 共享图标：不可 DestroyIcon

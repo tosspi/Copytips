@@ -2,5 +2,8 @@
 *.exe
 *.res
 *.o
+# diagnostic log switch & output (2.2.1)
+copytips.debug
+*.log
 # editor/agent scratch
 .workbuddy/

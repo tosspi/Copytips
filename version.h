@@ -10,10 +10,10 @@
 #define COPYTIPS_VERSION_H
 
 #define APP_VERSION_MAJOR 2
-#define APP_VERSION_MINOR 2
+#define APP_VERSION_MINOR 3
 #define APP_VERSION_PATCH 0
 
-#define APP_VERSION_STR   "2.2.0"
-#define APP_VERSION_WSTR  L"2.2.0"
+#define APP_VERSION_STR   "2.3.0"
+#define APP_VERSION_WSTR  L"2.3.0"
 
 #endif
